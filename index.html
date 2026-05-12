@@ -1073,6 +1073,7 @@ function SimulatorScreen({onBack}){
   const bottomRef=useRef(null);
   const nid=useRef(null);
   if(!nid.current)nid.current=1;
+  const clientHistRef=useRef([]); // conversation history for Gemini client
 
   useEffect(()=>{bottomRef.current&&bottomRef.current.scrollIntoView({behavior:"smooth"});},[msgs,typing]);
 
@@ -1080,19 +1081,13 @@ function SimulatorScreen({onBack}){
   useEffect(()=>{
     if(phase==="chat"&&msgs.length===2&&msgs[1]&&msgs[1].role==="expert"&&!typing&&turnIndex===0){
       const advisorText=msgs[1].text;
-      setTyping(true);
-      setTimeout(()=>{
-        const res=getClientReply(persona,difficulty,advisorText,0,0,{push:0,empathy:0});
-        const safeReply=(res.reply&&res.reply.trim())?res.reply:"Thank you. I feel like you actually see me. Tell me more.";
-        const newArcIdx=res.advanced?1:0;
-        setMsgs(p=>[...p,{role:"client",text:safeReply,id:nid.current++,feedback:res.vibe}]);
-        setSessionLog([{advisor:advisorText,vibe:res.vibe,advanced:res.advanced,turn:1}]);
-        setArcIndex(newArcIdx);
-        setTurnIndex(1);
-        if(res.fallbackType)setFallbackCounts(f=>({...f,[res.fallbackType]:(f[res.fallbackType]||0)+1}));
-        setTyping(false);
-      },1000+Math.random()*600);
+      // Re-use send logic by simulating the advisor's first message through the system
+      send(advisorText);
+      // Remove the pre-placed expert message and re-add via send
+      // Actually: just trigger client reply directly since msg is already shown
+      setMsgs(p=>p.filter((_,i)=>i<2)); // keep opening + advisor msg
     }
+  // eslint-disable-next-line
   },[phase]);
 
   function reset(){setPersona(null);setDifficulty(null);setIcebreaker(null);setDone(false);setPhase("select");}
@@ -1104,6 +1099,7 @@ function SimulatorScreen({onBack}){
     setPersona(p);setDifficulty(d);setIcebreaker(null);
     setMsgs([{role:"client",text:p.opening,id:nid.current++,feedback:null}]);
     setInput("");setTyping(false);setDone(false);setExpandFb({});setSessionLog([]);setArcIndex(0);setTurnIndex(0);setFallbackCounts({push:0,empathy:0});
+    clientHistRef.current=[];
     setPhase("chat");
   }
 
@@ -1112,30 +1108,137 @@ function SimulatorScreen({onBack}){
     const p=PERSONAS[Math.floor(Math.random()*PERSONAS.length)];
     const d=DIFF_LEVELS[Math.floor(Math.random()*DIFF_LEVELS.length)];
     setPersona(p);setDifficulty(d);setIcebreaker(clientMsg);
-    // Client opens with the chosen icebreaker message (not the persona opening)
     setMsgs([{role:"client",text:clientMsg,id:nid.current++,feedback:null}]);
     setInput("");setTyping(false);setDone(false);setExpandFb({});setSessionLog([]);setArcIndex(0);setTurnIndex(0);setFallbackCounts({push:0,empathy:0});
+    clientHistRef.current=[{role:"user",parts:[{text:"[Session start — client sends opening message]"}]},{role:"model",parts:[{text:clientMsg}]}];
     setPhase("chat");
   }
 
-  function send(text){
+  async function send(text){
     if(!text.trim()||typing||done||!persona)return;
     const advisorText=text.trim();
     setMsgs(p=>[...p,{role:"expert",text:advisorText,id:nid.current++}]);
     setInput("");setTyping(true);
-    setTimeout(()=>{
-      const res=getClientReply(persona,difficulty,advisorText,turnIndex,arcIndex,fallbackCounts);
-      const safeReply=(res.reply&&res.reply.trim())?res.reply:"Thank you. That actually resonated. I feel like I can breathe a little more now.";
-      const newArcIdx=res.advanced?arcIndex+1:arcIndex;
-      const newTurn=turnIndex+1;
-      if(res.fallbackType)setFallbackCounts(f=>({...f,[res.fallbackType]:(f[res.fallbackType]||0)+1}));
-      setMsgs(p=>[...p,{role:"client",text:safeReply,id:nid.current++,feedback:res.vibe}]);
-      setSessionLog(l=>[...l,{advisor:advisorText,vibe:res.vibe,advanced:res.advanced,turn:newTurn}]);
-      setArcIndex(newArcIdx);
-      setTurnIndex(newTurn);
-      // No auto-end — session ends only when user clicks End
-      setTyping(false);
-    },900+Math.random()*700);
+    const newTurn=turnIndex+1;
+
+    if(GEMINI_KEY.trim()){
+      // ── GEMINI: generate client reply + mentor feedback in parallel ──
+      const clientSystemText=
+        `You are roleplaying as a real client in a spiritual advisor chat on the Nebula platform.
+
+CHARACTER:
+Name: ${persona.name}
+Situation: ${persona.opening}
+Core wound: ${persona.situation}
+Difficulty level: ${difficulty.id} — ${difficulty.desc}
+${persona.predictTrap?"You have a strong pull toward asking for predictions and yes/no answers. If the advisor fails to empathize, you push for a definitive answer.":""}
+
+STRICT RULES:
+1. You ALWAYS respond to what the advisor JUST SAID — listen to their exact words.
+2. Stay in character. You are a real person in emotional pain, not a test subject.
+3. Keep responses to 1-3 sentences. You are texting, not writing an essay.
+4. Do NOT ask questions — make statements, reactions, half-thoughts. Let silence do work.
+5. Emotional arc: guarded → slightly open → more vulnerable (if advisor shows empathy) OR more resistant → prediction-seeking (if advisor is generic/robotic).
+6. At difficulty "${difficulty.id}": ${difficulty.id==="Light"?"you warm up quickly with any warmth shown":difficulty.id==="Light+"?"mostly open but occasionally slip into wanting a prediction":difficulty.id==="Middle"?"you test whether the reframe is real before accepting it":difficulty.id==="High"?"you need logic and proof before emotional opening":difficulty.id==="Difficult"?"you fall into shame loops and push hard for answers":"you are in genuine crisis and everything feels impossible"}.
+7. Never say you are in a simulation. Never break character.
+8. Respond ONLY with the client's next message. No labels, no narration.`;
+
+      const mentorSystemText=
+        `You are Luna — a master spiritual advisor coach watching a training session.
+
+CLIENT: ${persona.name} (${persona.situation})
+DIFFICULTY: ${difficulty.id} — ${difficulty.desc}
+
+Analyse the advisor's message and return ONLY a JSON object in this exact format:
+{"vibe":"emoji + 2-4 word label","score":number 1-10,"note":"1 sentence: what the advisor did or missed","tip":"1-2 sentences: a reflective coaching question — never tell them what to say"}
+
+Scoring: 9-10=genuine emotional presence before insight, 7-8=solid empathy minor gaps, 5-6=some warmth but rushed to solution, 3-4=bypassed emotion, 1-2=robotic or cold.
+Return ONLY the JSON. No other text.`;
+
+      try{
+        // Add advisor message to client history
+        const newClientHist=[
+          ...clientHistRef.current,
+          {role:"user",parts:[{text:advisorText}]}
+        ];
+
+        const clientBody=JSON.stringify({
+          contents:[
+            {role:"user",  parts:[{text:clientSystemText+"\n\nAcknowledge your character briefly."}]},
+            {role:"model", parts:[{text:"Understood. In character, ready."}]},
+            ...newClientHist
+          ],
+          generationConfig:{maxOutputTokens:120,temperature:0.9},
+          safetySettings:[
+            {category:"HARM_CATEGORY_HARASSMENT",        threshold:"BLOCK_NONE"},
+            {category:"HARM_CATEGORY_HATE_SPEECH",       threshold:"BLOCK_NONE"},
+            {category:"HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold:"BLOCK_NONE"},
+            {category:"HARM_CATEGORY_DANGEROUS_CONTENT", threshold:"BLOCK_NONE"},
+          ]
+        });
+
+        const mentorBody=JSON.stringify({
+          contents:[{role:"user",parts:[{text:mentorSystemText+`\n\nAdvisor said: "${advisorText}"\nClient had said: "${msgs[msgs.length-1]?.text||persona.opening}"`}]}],
+          generationConfig:{maxOutputTokens:200,temperature:0.4},
+          safetySettings:[
+            {category:"HARM_CATEGORY_HARASSMENT",        threshold:"BLOCK_NONE"},
+            {category:"HARM_CATEGORY_HATE_SPEECH",       threshold:"BLOCK_NONE"},
+            {category:"HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold:"BLOCK_NONE"},
+            {category:"HARM_CATEGORY_DANGEROUS_CONTENT", threshold:"BLOCK_NONE"},
+          ]
+        });
+
+        const base=`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`;
+        const [clientRes,mentorRes]=await Promise.all([
+          fetch(base,{method:"POST",headers:{"Content-Type":"application/json"},body:clientBody}),
+          fetch(base,{method:"POST",headers:{"Content-Type":"application/json"},body:mentorBody}),
+        ]);
+
+        const [clientData,mentorData]=await Promise.all([clientRes.json(),mentorRes.json()]);
+
+        const clientReply=(clientData?.candidates?.[0]?.content?.parts?.[0]?.text||"").trim();
+        const safeReply=clientReply||"I'm still processing what you said.";
+
+        let vibe={vibe:"💚 Response Received",score:7,note:"Keep going — the conversation is building.",tip:"What does this client most need from you right now — insight or presence?"};
+        try{
+          const raw=mentorData?.candidates?.[0]?.content?.parts?.[0]?.text||"";
+          const cleaned=raw.replace(/```json|```/g,"").trim();
+          const parsed=JSON.parse(cleaned);
+          if(parsed.vibe&&parsed.score&&parsed.note&&parsed.tip)vibe=parsed;
+        }catch{}
+
+        // Update client history
+        clientHistRef.current=[...newClientHist,{role:"model",parts:[{text:safeReply}]}];
+
+        setMsgs(p=>[...p,{role:"client",text:safeReply,id:nid.current++,feedback:vibe}]);
+        setSessionLog(l=>[...l,{advisor:advisorText,vibe,advanced:vibe.score>=7,turn:newTurn}]);
+        setTurnIndex(newTurn);
+      }catch(e){
+        // Silent fallback to scripted system
+        const res=getClientReply(persona,difficulty,advisorText,turnIndex,arcIndex,fallbackCounts);
+        const safeReply=(res.reply&&res.reply.trim())?res.reply:"I'm still here. Still processing.";
+        const newArcIdx=res.advanced?arcIndex+1:arcIndex;
+        if(res.fallbackType)setFallbackCounts(f=>({...f,[res.fallbackType]:(f[res.fallbackType]||0)+1}));
+        setMsgs(p=>[...p,{role:"client",text:safeReply,id:nid.current++,feedback:res.vibe}]);
+        setSessionLog(l=>[...l,{advisor:advisorText,vibe:res.vibe,advanced:res.advanced,turn:newTurn}]);
+        setArcIndex(newArcIdx);
+        setTurnIndex(newTurn);
+      }
+    } else {
+      // ── OFFLINE: scripted system ──
+      setTimeout(()=>{
+        const res=getClientReply(persona,difficulty,advisorText,turnIndex,arcIndex,fallbackCounts);
+        const safeReply=(res.reply&&res.reply.trim())?res.reply:"Thank you. That actually resonated.";
+        const newArcIdx=res.advanced?arcIndex+1:arcIndex;
+        if(res.fallbackType)setFallbackCounts(f=>({...f,[res.fallbackType]:(f[res.fallbackType]||0)+1}));
+        setMsgs(p=>[...p,{role:"client",text:safeReply,id:nid.current++,feedback:res.vibe}]);
+        setSessionLog(l=>[...l,{advisor:advisorText,vibe:res.vibe,advanced:res.advanced,turn:newTurn}]);
+        setArcIndex(newArcIdx);
+        setTurnIndex(newTurn);
+      },900+Math.random()*700);
+    }
+
+    setTyping(false);
   }
 
   const progress=persona?Math.min(100,Math.round((arcIndex/persona.arc.length)*100)):0;
