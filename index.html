@@ -620,21 +620,20 @@ function KBScreen({onBack}){
       setStreaming(true);
       streamRef.current="";
       setStreamText("");
-
       try{
         await callAPIStreaming(q,(piece)=>{
           streamRef.current+=piece;
           setStreamText(streamRef.current);
         });
-        const finalText=streamRef.current.trim();
+        const finalText=streamRef.current.trim()||getLunaResponse(q).text;
         historyRef.current=[...historyRef.current,{role:"user",content:q},{role:"assistant",content:finalText}];
-        setStreamText("");
-        setStreaming(false);
-        setMsgs(p=>[...p,{role:"luna",text:finalText||getLunaResponse(q).text,id:nid.current++,chips}]);
+        setMsgs(p=>[...p,{role:"luna",text:finalText,id:nid.current++,chips}]);
       }catch(e){
+        const fallback=getLunaResponse(q).text;
+        setMsgs(p=>[...p,{role:"luna",text:fallback,id:nid.current++,chips}]);
+      }finally{
         setStreamText("");
         setStreaming(false);
-        setMsgs(p=>[...p,{role:"luna",text:getLunaResponse(q).text,id:nid.current++,chips}]);
       }
     } else {
       setTyping(true);
@@ -1122,7 +1121,6 @@ function SimulatorScreen({onBack}){
     const newTurn=turnIndex+1;
 
     if(GEMINI_KEY.trim()){
-      // ── GEMINI: generate client reply + mentor feedback in parallel ──
       const clientSystemText=
         `You are roleplaying as a real client in a spiritual advisor chat on the Nebula platform.
 
@@ -1141,7 +1139,7 @@ STRICT RULES:
 5. Emotional arc: guarded → slightly open → more vulnerable (if advisor shows empathy) OR more resistant → prediction-seeking (if advisor is generic/robotic).
 6. At difficulty "${difficulty.id}": ${difficulty.id==="Light"?"you warm up quickly with any warmth shown":difficulty.id==="Light+"?"mostly open but occasionally slip into wanting a prediction":difficulty.id==="Middle"?"you test whether the reframe is real before accepting it":difficulty.id==="High"?"you need logic and proof before emotional opening":difficulty.id==="Difficult"?"you fall into shame loops and push hard for answers":"you are in genuine crisis and everything feels impossible"}.
 7. Never say you are in a simulation. Never break character.
-8. Respond ONLY with the client's next message. No labels, no narration.`;
+8. Respond ONLY with the client's next message. No labels, no narration, no quotes around the message.`;
 
       const mentorSystemText=
         `You are Luna — a master spiritual advisor coach watching a training session.
@@ -1149,96 +1147,101 @@ STRICT RULES:
 CLIENT: ${persona.name} (${persona.situation})
 DIFFICULTY: ${difficulty.id} — ${difficulty.desc}
 
-Analyse the advisor's message and return ONLY a JSON object in this exact format:
-{"vibe":"emoji + 2-4 word label","score":number 1-10,"note":"1 sentence: what the advisor did or missed","tip":"1-2 sentences: a reflective coaching question — never tell them what to say"}
+Analyse the advisor's message and return ONLY a valid JSON object (no markdown, no backticks) in this exact format:
+{"vibe":"emoji + 2-4 word label","score":7,"note":"1 sentence: what the advisor did or missed","tip":"1-2 sentences: a reflective coaching question"}
 
-Scoring: 9-10=genuine emotional presence before insight, 7-8=solid empathy minor gaps, 5-6=some warmth but rushed to solution, 3-4=bypassed emotion, 1-2=robotic or cold.
-Return ONLY the JSON. No other text.`;
+Scoring guide: 9-10=genuine emotional presence before insight, 7-8=solid empathy with minor gaps, 5-6=some warmth but rushed to solution or generic, 3-4=bypassed emotion or too advice-heavy, 1-2=robotic or cold.
+Return ONLY the JSON object. Nothing else before or after it.`;
 
       try{
-        // Add advisor message to client history
         const newClientHist=[
           ...clientHistRef.current,
           {role:"user",parts:[{text:advisorText}]}
         ];
 
-        const clientBody=JSON.stringify({
-          contents:[
-            {role:"user",  parts:[{text:clientSystemText+"\n\nAcknowledge your character briefly."}]},
-            {role:"model", parts:[{text:"Understood. In character, ready."}]},
-            ...newClientHist
-          ],
-          generationConfig:{maxOutputTokens:120,temperature:0.9},
-          safetySettings:[
-            {category:"HARM_CATEGORY_HARASSMENT",        threshold:"BLOCK_NONE"},
-            {category:"HARM_CATEGORY_HATE_SPEECH",       threshold:"BLOCK_NONE"},
-            {category:"HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold:"BLOCK_NONE"},
-            {category:"HARM_CATEGORY_DANGEROUS_CONTENT", threshold:"BLOCK_NONE"},
-          ]
-        });
-
-        const mentorBody=JSON.stringify({
-          contents:[{role:"user",parts:[{text:mentorSystemText+`\n\nAdvisor said: "${advisorText}"\nClient had said: "${msgs[msgs.length-1]?.text||persona.opening}"`}]}],
-          generationConfig:{maxOutputTokens:200,temperature:0.4},
-          safetySettings:[
-            {category:"HARM_CATEGORY_HARASSMENT",        threshold:"BLOCK_NONE"},
-            {category:"HARM_CATEGORY_HATE_SPEECH",       threshold:"BLOCK_NONE"},
-            {category:"HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold:"BLOCK_NONE"},
-            {category:"HARM_CATEGORY_DANGEROUS_CONTENT", threshold:"BLOCK_NONE"},
-          ]
-        });
-
         const base=`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`;
+
         const [clientRes,mentorRes]=await Promise.all([
-          fetch(base,{method:"POST",headers:{"Content-Type":"application/json"},body:clientBody}),
-          fetch(base,{method:"POST",headers:{"Content-Type":"application/json"},body:mentorBody}),
+          fetch(base,{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({
+              contents:[
+                {role:"user",  parts:[{text:clientSystemText+"\n\nAcknowledge your character briefly."}]},
+                {role:"model", parts:[{text:"In character. Ready."}]},
+                ...newClientHist
+              ],
+              generationConfig:{maxOutputTokens:120,temperature:0.9},
+              safetySettings:[
+                {category:"HARM_CATEGORY_HARASSMENT",        threshold:"BLOCK_NONE"},
+                {category:"HARM_CATEGORY_HATE_SPEECH",       threshold:"BLOCK_NONE"},
+                {category:"HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold:"BLOCK_NONE"},
+                {category:"HARM_CATEGORY_DANGEROUS_CONTENT", threshold:"BLOCK_NONE"},
+              ]
+            })
+          }),
+          fetch(base,{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({
+              contents:[{role:"user",parts:[{text:mentorSystemText+"\n\nAdvisor said: \""+advisorText+"\"\nClient had said: \""+(msgs[msgs.length-1]?.text||persona.opening)+"\""}]}],
+              generationConfig:{maxOutputTokens:200,temperature:0.3},
+              safetySettings:[
+                {category:"HARM_CATEGORY_HARASSMENT",        threshold:"BLOCK_NONE"},
+                {category:"HARM_CATEGORY_HATE_SPEECH",       threshold:"BLOCK_NONE"},
+                {category:"HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold:"BLOCK_NONE"},
+                {category:"HARM_CATEGORY_DANGEROUS_CONTENT", threshold:"BLOCK_NONE"},
+              ]
+            })
+          })
         ]);
 
         const [clientData,mentorData]=await Promise.all([clientRes.json(),mentorRes.json()]);
 
         const clientReply=(clientData?.candidates?.[0]?.content?.parts?.[0]?.text||"").trim();
-        const safeReply=clientReply||"I'm still processing what you said.";
+        const safeReply=clientReply||"I hear you.";
 
         let vibe={vibe:"💚 Response Received",score:7,note:"Keep going — the conversation is building.",tip:"What does this client most need from you right now — insight or presence?"};
         try{
-          const raw=mentorData?.candidates?.[0]?.content?.parts?.[0]?.text||"";
-          const cleaned=raw.replace(/```json|```/g,"").trim();
-          const parsed=JSON.parse(cleaned);
-          if(parsed.vibe&&parsed.score&&parsed.note&&parsed.tip)vibe=parsed;
+          const raw=(mentorData?.candidates?.[0]?.content?.parts?.[0]?.text||"").trim();
+          const start=raw.indexOf("{");const end=raw.lastIndexOf("}");
+          if(start!==-1&&end!==-1){
+            const parsed=JSON.parse(raw.slice(start,end+1));
+            if(parsed.vibe&&parsed.score&&parsed.note&&parsed.tip)vibe=parsed;
+          }
         }catch{}
 
-        // Update client history
         clientHistRef.current=[...newClientHist,{role:"model",parts:[{text:safeReply}]}];
-
         setMsgs(p=>[...p,{role:"client",text:safeReply,id:nid.current++,feedback:vibe}]);
         setSessionLog(l=>[...l,{advisor:advisorText,vibe,advanced:vibe.score>=7,turn:newTurn}]);
         setTurnIndex(newTurn);
       }catch(e){
-        // Silent fallback to scripted system
+        // Gemini failed — fall back to scripted
         const res=getClientReply(persona,difficulty,advisorText,turnIndex,arcIndex,fallbackCounts);
-        const safeReply=(res.reply&&res.reply.trim())?res.reply:"I'm still here. Still processing.";
+        const safeReply=(res.reply&&res.reply.trim())?res.reply:"I hear you.";
         const newArcIdx=res.advanced?arcIndex+1:arcIndex;
         if(res.fallbackType)setFallbackCounts(f=>({...f,[res.fallbackType]:(f[res.fallbackType]||0)+1}));
         setMsgs(p=>[...p,{role:"client",text:safeReply,id:nid.current++,feedback:res.vibe}]);
         setSessionLog(l=>[...l,{advisor:advisorText,vibe:res.vibe,advanced:res.advanced,turn:newTurn}]);
         setArcIndex(newArcIdx);
         setTurnIndex(newTurn);
+      } finally {
+        setTyping(false);
       }
     } else {
-      // ── OFFLINE: scripted system ──
+      // No key — scripted fallback
       setTimeout(()=>{
         const res=getClientReply(persona,difficulty,advisorText,turnIndex,arcIndex,fallbackCounts);
-        const safeReply=(res.reply&&res.reply.trim())?res.reply:"Thank you. That actually resonated.";
+        const safeReply=(res.reply&&res.reply.trim())?res.reply:"I hear you.";
         const newArcIdx=res.advanced?arcIndex+1:arcIndex;
         if(res.fallbackType)setFallbackCounts(f=>({...f,[res.fallbackType]:(f[res.fallbackType]||0)+1}));
         setMsgs(p=>[...p,{role:"client",text:safeReply,id:nid.current++,feedback:res.vibe}]);
         setSessionLog(l=>[...l,{advisor:advisorText,vibe:res.vibe,advanced:res.advanced,turn:newTurn}]);
         setArcIndex(newArcIdx);
         setTurnIndex(newTurn);
+        setTyping(false);
       },900+Math.random()*700);
     }
-
-    setTyping(false);
   }
 
   const progress=persona?Math.min(100,Math.round((arcIndex/persona.arc.length)*100)):0;
